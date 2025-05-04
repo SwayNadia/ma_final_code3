@@ -28,6 +28,7 @@ def render_single_image(
     train_depth_prior=None,
     data_mode=None,
 ):
+    """Render a single image and return both 2D and 3D data"""
     """
     :param ray_sampler: RaySamplingSingleImage for this view
     :param model:  {'net_coarse': , 'net_fine': , ...}
@@ -43,6 +44,18 @@ def render_single_image(
     all_ret = OrderedDict([("outputs_coarse", OrderedDict()), ("outputs_fine", OrderedDict())])
 
     N_rays = ray_batch["ray_o"].shape[0]  # 360000 in train, 1440000 in eval
+
+    # Create dictionary to store 3D data
+    three_d_data = {
+        "ray_origins": [],
+        "ray_directions": [],
+        "sample_points": [],
+        "features": [],
+        "colors": [],
+        "densities": [],
+        "weights": [],
+        "z_values": []
+    }
 
     for i in range(0, N_rays, chunk_size):
         chunk = OrderedDict()
@@ -63,6 +76,10 @@ def render_single_image(
         else:
             train_depth_prior_chunk = None
 
+        # Store 3D data
+        three_d_data["ray_origins"].append(chunk["ray_o"])
+        three_d_data["ray_directions"].append(chunk["ray_d"])
+
         ret, _ = render_rays(
             args,
             chunk,
@@ -77,14 +94,27 @@ def render_single_image(
             ret_alpha=ret_alpha,
             single_net=single_net,
             sky_style_code=sky_style_code,
-            # sky_style_model=sky_style_model,
             sky_model=sky_model,
-            mode = 'val',
+            mode=mode,
             feature_volume=feature_volume,
             use_updated_prior_depth=use_updated_prior_depth,
             train_depth_prior=train_depth_prior_chunk,
-            data_mode = data_mode,
+            data_mode=data_mode,
         )
+
+        # Store additional 3D data from render_rays output
+        if "sample_points" in ret:
+            three_d_data["sample_points"].append(ret["sample_points"])
+        if "features" in ret:
+            three_d_data["features"].append(ret["features"])
+        if "colors" in ret:
+            three_d_data["colors"].append(ret["colors"])
+        if "densities" in ret:
+            three_d_data["densities"].append(ret["densities"])
+        if "weights" in ret["outputs_coarse"]:
+            three_d_data["weights"].append(ret["outputs_coarse"]["weights"])
+        if "z_vals" in ret:
+            three_d_data["z_values"].append(ret["z_vals"])
 
         # handle both coarse and fine outputs
         # cache chunk results on cpu
@@ -108,6 +138,14 @@ def render_single_image(
             for k in ret["outputs_fine"]:
                 if ret["outputs_fine"][k] is not None:
                     all_ret["outputs_fine"][k].append(ret["outputs_fine"][k].cpu())
+
+    # Concatenate all stored 3D data
+    for key in three_d_data:
+        if three_d_data[key]:
+            three_d_data[key] = torch.cat(three_d_data[key], dim=0)
+
+    # Add 3D data to return value
+    all_ret["three_d_data"] = three_d_data
 
     rgb_strided = torch.ones(ray_sampler.H, ray_sampler.W, 3)[::render_stride, ::render_stride, :]
     # merge chunk results and reshape
@@ -142,3 +180,60 @@ def render_single_image(
             all_ret["outputs_fine"][k] = tmp.squeeze()
 
     return all_ret
+
+def log_view(
+    global_step,
+    args,
+    model,
+    ray_sampler,
+    projector,
+    gt_img,
+    render_stride=1,
+    prefix="",
+    out_folder="",
+    ret_alpha=False,
+    single_net=True,
+    sky_style_code=None,
+    sky_model=None,
+    data_mode=None,
+):
+    """Log a view to the viewer and save to disk"""
+    # ... existing code ...
+
+    # Initialize viewer if not already initialized
+    if not hasattr(args, 'viewer'):
+        from visualization import Viewer
+        args.viewer = Viewer(port=8080)
+        args.viewer.viser_server.on_client_connect(args.viewer.handle_new_client)
+        args.viewer.viser_server.on_client_disconnect(args.viewer.handle_disconnect)
+
+    ret = render_single_image(
+        args,
+        ray_sampler=ray_sampler,
+        ray_batch=ray_batch,
+        model=model,
+        projector=projector,
+        chunk_size=args.chunk_size,
+        N_samples=args.N_samples,
+        inv_uniform=args.inv_uniform,
+        det=True,
+        N_importance=args.N_importance,
+        white_bkgd=args.white_bkgd,
+        render_stride=render_stride,
+        featmaps=featmaps,
+        ret_alpha=ret_alpha,
+        single_net=single_net,
+        sky_style_code=sky_style_code,
+        sky_model=sky_model,
+        feature_volume=feature_volume,
+        data_mode=data_mode,
+        use_updated_prior_depth=True
+    )
+
+    # Store 3D data for visualization
+    args.viewer.current_3d_data = ret["three_d_data"]
+    
+    # Visualize 3D data
+    args.viewer.visualize_3d_data(ret["three_d_data"])
+
+    # ... rest of the existing code ...
