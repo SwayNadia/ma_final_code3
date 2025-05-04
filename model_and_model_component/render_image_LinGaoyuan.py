@@ -1,7 +1,16 @@
 import torch
 from collections import OrderedDict
 from model_and_model_component.render_ray_LinGaoyuan import render_rays
+from ma_final_code3.viewer.viewer3d import Viewer3D
 
+# Global viewer instance
+_global_viewer = None
+
+def get_viewer():
+    global _global_viewer
+    if _global_viewer is None:
+        _global_viewer = Viewer3D()
+    return _global_viewer
 
 def render_single_image(
     args,
@@ -27,8 +36,8 @@ def render_single_image(
     use_updated_prior_depth=False,
     train_depth_prior=None,
     data_mode=None,
+    enable_3d_visualization=True,  # New parameter to control visualization
 ):
-    """Render a single image and return both 2D and 3D data"""
     """
     :param ray_sampler: RaySamplingSingleImage for this view
     :param model:  {'net_coarse': , 'net_fine': , ...}
@@ -38,6 +47,7 @@ def render_single_image(
     :param N_importance: additional samples along each ray produced by importance sampling (for fine model)
     :param ret_alpha: if True, will return learned 'density' values inferred from the attention maps
     :param single_net: if True, will use single network, can be cued with both coarse and fine points
+    :param enable_3d_visualization: if True, will visualize the 3D scene in viser
     :return: {'outputs_coarse': {'rgb': numpy, 'depth': numpy, ...}, 'outputs_fine': {}}
     """
 
@@ -45,16 +55,16 @@ def render_single_image(
 
     N_rays = ray_batch["ray_o"].shape[0]  # 360000 in train, 1440000 in eval
 
-    # Create dictionary to store 3D data
+    # 创建存储3D数据的字典
     three_d_data = {
-        "ray_origins": [],
-        "ray_directions": [],
-        "sample_points": [],
-        "features": [],
-        "colors": [],
-        "densities": [],
-        "weights": [],
-        "z_values": []
+        "ray_origins": [],      # 光线起点
+        "ray_directions": [],   # 光线方向
+        "sample_points": [],    # 采样点
+        "features": [],         # 特征向量
+        "colors": [],          # 颜色值
+        "densities": [],       # 密度值
+        "weights": [],         # 权重
+        "z_values": []         # 深度值
     }
 
     for i in range(0, N_rays, chunk_size):
@@ -76,7 +86,7 @@ def render_single_image(
         else:
             train_depth_prior_chunk = None
 
-        # Store 3D data
+        # 存储光线数据
         three_d_data["ray_origins"].append(chunk["ray_o"])
         three_d_data["ray_directions"].append(chunk["ray_d"])
 
@@ -94,15 +104,16 @@ def render_single_image(
             ret_alpha=ret_alpha,
             single_net=single_net,
             sky_style_code=sky_style_code,
+            # sky_style_model=sky_style_model,
             sky_model=sky_model,
-            mode=mode,
+            mode = 'val',
             feature_volume=feature_volume,
             use_updated_prior_depth=use_updated_prior_depth,
             train_depth_prior=train_depth_prior_chunk,
-            data_mode=data_mode,
+            data_mode = data_mode,
         )
 
-        # Store additional 3D data from render_rays output
+        # 存储3D数据
         if "sample_points" in ret:
             three_d_data["sample_points"].append(ret["sample_points"])
         if "features" in ret:
@@ -139,13 +150,18 @@ def render_single_image(
                 if ret["outputs_fine"][k] is not None:
                     all_ret["outputs_fine"][k].append(ret["outputs_fine"][k].cpu())
 
-    # Concatenate all stored 3D data
+    # 合并所有chunk的3D数据
     for key in three_d_data:
         if three_d_data[key]:
             three_d_data[key] = torch.cat(three_d_data[key], dim=0)
 
-    # Add 3D data to return value
+    # 将3D数据添加到返回结果中
     all_ret["three_d_data"] = three_d_data
+
+    # 如果启用了3D可视化，更新viewer
+    if enable_3d_visualization and mode == 'val':
+        viewer = get_viewer()
+        viewer.visualize_3d_data(three_d_data)
 
     rgb_strided = torch.ones(ray_sampler.H, ray_sampler.W, 3)[::render_stride, ::render_stride, :]
     # merge chunk results and reshape
@@ -197,15 +213,7 @@ def log_view(
     sky_model=None,
     data_mode=None,
 ):
-    """Log a view to the viewer and save to disk"""
-    # ... existing code ...
-
-    # Initialize viewer if not already initialized
-    if not hasattr(args, 'viewer'):
-        from visualization import Viewer
-        args.viewer = Viewer(port=8080)
-        args.viewer.viser_server.on_client_connect(args.viewer.handle_new_client)
-        args.viewer.viser_server.on_client_disconnect(args.viewer.handle_disconnect)
+    # ... 其他代码 ...
 
     ret = render_single_image(
         args,
@@ -230,10 +238,11 @@ def log_view(
         use_updated_prior_depth=True
     )
 
-    # Store 3D data for visualization
-    args.viewer.current_3d_data = ret["three_d_data"]
+    # 获取3D数据
+    three_d_data = ret["three_d_data"]
     
-    # Visualize 3D data
-    args.viewer.visualize_3d_data(ret["three_d_data"])
+    # 使用3D数据进行可视化或其他操作
+    if args.visualize_3d:
+        visualize_3d_data(three_d_data)
 
-    # ... rest of the existing code ...
+    # ... 其他代码 ...
