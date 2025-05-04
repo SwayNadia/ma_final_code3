@@ -2,7 +2,7 @@
 expname = Nuscene_scene_0075_final_version_eval
 # expname = Nuscene_aliasing_bounded
 
-rootdir = ./
+rootdir = /root/autodl-tmp
 render_stride = 1
 distributed = False
 
