@@ -1,16 +1,7 @@
 import torch
 from collections import OrderedDict
 from model_and_model_component.render_ray_LinGaoyuan import render_rays
-from ma_final_code3.viewer.viewer3d import Viewer3D
 
-# Global viewer instance
-_global_viewer = None
-
-def get_viewer():
-    global _global_viewer
-    if _global_viewer is None:
-        _global_viewer = Viewer3D()
-    return _global_viewer
 
 def render_single_image(
     args,
@@ -36,7 +27,6 @@ def render_single_image(
     use_updated_prior_depth=False,
     train_depth_prior=None,
     data_mode=None,
-    enable_3d_visualization=True,  # New parameter to control visualization
 ):
     """
     :param ray_sampler: RaySamplingSingleImage for this view
@@ -47,25 +37,12 @@ def render_single_image(
     :param N_importance: additional samples along each ray produced by importance sampling (for fine model)
     :param ret_alpha: if True, will return learned 'density' values inferred from the attention maps
     :param single_net: if True, will use single network, can be cued with both coarse and fine points
-    :param enable_3d_visualization: if True, will visualize the 3D scene in viser
     :return: {'outputs_coarse': {'rgb': numpy, 'depth': numpy, ...}, 'outputs_fine': {}}
     """
 
     all_ret = OrderedDict([("outputs_coarse", OrderedDict()), ("outputs_fine", OrderedDict())])
 
     N_rays = ray_batch["ray_o"].shape[0]  # 360000 in train, 1440000 in eval
-
-    # 创建存储3D数据的字典
-    three_d_data = {
-        "ray_origins": [],      # 光线起点
-        "ray_directions": [],   # 光线方向
-        "sample_points": [],    # 采样点
-        "features": [],         # 特征向量
-        "colors": [],          # 颜色值
-        "densities": [],       # 密度值
-        "weights": [],         # 权重
-        "z_values": []         # 深度值
-    }
 
     for i in range(0, N_rays, chunk_size):
         chunk = OrderedDict()
@@ -85,10 +62,6 @@ def render_single_image(
             train_depth_prior_chunk = train_depth_prior[i : i + chunk_size]
         else:
             train_depth_prior_chunk = None
-
-        # 存储光线数据
-        three_d_data["ray_origins"].append(chunk["ray_o"])
-        three_d_data["ray_directions"].append(chunk["ray_d"])
 
         ret, _ = render_rays(
             args,
@@ -113,20 +86,6 @@ def render_single_image(
             data_mode = data_mode,
         )
 
-        # 存储3D数据
-        if "sample_points" in ret:
-            three_d_data["sample_points"].append(ret["sample_points"])
-        if "features" in ret:
-            three_d_data["features"].append(ret["features"])
-        if "colors" in ret:
-            three_d_data["colors"].append(ret["colors"])
-        if "densities" in ret:
-            three_d_data["densities"].append(ret["densities"])
-        if "weights" in ret["outputs_coarse"]:
-            three_d_data["weights"].append(ret["outputs_coarse"]["weights"])
-        if "z_vals" in ret:
-            three_d_data["z_values"].append(ret["z_vals"])
-
         # handle both coarse and fine outputs
         # cache chunk results on cpu
         if i == 0:
@@ -149,19 +108,6 @@ def render_single_image(
             for k in ret["outputs_fine"]:
                 if ret["outputs_fine"][k] is not None:
                     all_ret["outputs_fine"][k].append(ret["outputs_fine"][k].cpu())
-
-    # 合并所有chunk的3D数据
-    for key in three_d_data:
-        if three_d_data[key]:
-            three_d_data[key] = torch.cat(three_d_data[key], dim=0)
-
-    # 将3D数据添加到返回结果中
-    all_ret["three_d_data"] = three_d_data
-
-    # 如果启用了3D可视化，更新viewer
-    if enable_3d_visualization and mode == 'val':
-        viewer = get_viewer()
-        viewer.visualize_3d_data(three_d_data)
 
     rgb_strided = torch.ones(ray_sampler.H, ray_sampler.W, 3)[::render_stride, ::render_stride, :]
     # merge chunk results and reshape
@@ -196,53 +142,3 @@ def render_single_image(
             all_ret["outputs_fine"][k] = tmp.squeeze()
 
     return all_ret
-
-def log_view(
-    global_step,
-    args,
-    model,
-    ray_sampler,
-    projector,
-    gt_img,
-    render_stride=1,
-    prefix="",
-    out_folder="",
-    ret_alpha=False,
-    single_net=True,
-    sky_style_code=None,
-    sky_model=None,
-    data_mode=None,
-):
-    # ... 其他代码 ...
-
-    ret = render_single_image(
-        args,
-        ray_sampler=ray_sampler,
-        ray_batch=ray_batch,
-        model=model,
-        projector=projector,
-        chunk_size=args.chunk_size,
-        N_samples=args.N_samples,
-        inv_uniform=args.inv_uniform,
-        det=True,
-        N_importance=args.N_importance,
-        white_bkgd=args.white_bkgd,
-        render_stride=render_stride,
-        featmaps=featmaps,
-        ret_alpha=ret_alpha,
-        single_net=single_net,
-        sky_style_code=sky_style_code,
-        sky_model=sky_model,
-        feature_volume=feature_volume,
-        data_mode=data_mode,
-        use_updated_prior_depth=True
-    )
-
-    # 获取3D数据
-    three_d_data = ret["three_d_data"]
-    
-    # 使用3D数据进行可视化或其他操作
-    if args.visualize_3d:
-        visualize_3d_data(three_d_data)
-
-    # ... 其他代码 ...
