@@ -3,9 +3,6 @@ import numpy as np
 import shutil
 import torch
 import torch.utils.data.distributed
-import viser
-import threading
-import time
 
 from torch.utils.data import DataLoader
 
@@ -23,8 +20,11 @@ from PIL import Image
 
 from LinGaoyuan_function.sky_network import SKYMLP, StyleMLP, SkyModel
 from LinGaoyuan_function.sky_transformer_network import SkyTransformer, SkyTransformerModel
-
+from viewer import Viewer  # 添加viewer导入
 import json
+import webbrowser
+import threading
+import time
 
 
 def worker_init_fn(worker_id):
@@ -46,85 +46,39 @@ def synchronize():
     dist.barrier()
 
 
-def create_viser_server():
-    """Create and configure viser server for 3D visualization."""
-    server = viser.ViserServer()
-    
-    # Configure environment
-    server.scene.configure_environment_map(
-        hdri="warehouse",
-        background=True,
-        background_intensity=1.0
-    )
-    
-    # Add world frame
-    server.scene.add_frame(
-        name="world_frame",
-        show_axes=True,
-        axes_length=1.0,
-        axes_radius=0.02
-    )
-    
-    return server
-
-def update_visualization(server, point_cloud_data):
-    """Update the 3D visualization with new point cloud data."""
-    # Remove existing point cloud if it exists
-    try:
-        server.scene.remove_by_name("scene_points")
-    except:
-        pass
-    
-    # Add new point cloud
-    point_cloud = server.scene.add_point_cloud(
-        name="scene_points",
-        points=point_cloud_data["points"],
-        colors=point_cloud_data["colors"],
-        point_size=0.01,
-        point_shape="circle"
-    )
-    
-    # Add normals if available
-    if point_cloud_data["normals"] is not None:
-        try:
-            server.scene.remove_by_name("normals")
-        except:
-            pass
-            
-        # Calculate normal endpoints
-        normal_endpoints = point_cloud_data["points"] + point_cloud_data["normals"] * 0.1
-        normal_lines = np.stack([
-            point_cloud_data["points"],
-            normal_endpoints
-        ], axis=1)
-        
-        # Add normal lines
-        server.scene.add_line_segments(
-            name="normals",
-            points=normal_lines,
-            colors=(255, 0, 0),
-            line_width=1.0
-        )
-
 @torch.no_grad()
 def eval(args):
+
     device = "cuda:{}".format(args.local_rank)
     out_folder = os.path.join(args.rootdir, "out", args.expname)
     print("outputs will be saved to {}".format(out_folder))
     os.makedirs(out_folder, exist_ok=True)
 
-    # Create viser server
-    server = create_viser_server()
-    
-    # Start viser server in a separate thread
-    def run_server():
-        server.sleep_forever()
-    
-    server_thread = threading.Thread(target=run_server)
-    server_thread.daemon = True
-    server_thread.start()
-    
-    print(f"Viser server started at http://localhost:{server.get_port()}")
+    # Initialize viewer automatically
+    viewer = None
+    if args.local_rank == 0:  # 只在主进程启动viewer
+        try:
+            # 尝试不同的端口，直到找到可用的
+            port = 8080
+            max_attempts = 10
+            for _ in range(max_attempts):
+                try:
+                    viewer = Viewer(port=port)
+                    print(f"Viewer initialized at port {port}")
+                    # 自动打开浏览器
+                    def open_browser():
+                        time.sleep(1)  # 等待服务器启动
+                        webbrowser.open(f'http://localhost:{port}')
+                    threading.Thread(target=open_browser, daemon=True).start()
+                    break
+                except Exception as e:
+                    print(f"Failed to initialize viewer on port {port}: {e}")
+                    port += 1
+            if viewer is None:
+                print("Failed to initialize viewer after multiple attempts")
+        except Exception as e:
+            print(f"Failed to initialize viewer: {e}")
+            viewer = None
 
     # save the args and config files
     f = os.path.join(out_folder, "args.txt")
@@ -203,21 +157,24 @@ def eval(args):
             tmp_ray_sampler = RaySamplerSingleImage(data, device, render_stride=args.render_stride)
             H, W = tmp_ray_sampler.H, tmp_ray_sampler.W
             gt_img = tmp_ray_sampler.rgb.reshape(H, W, 3)
+
+            # 获取3D可视化数据
+            if viewer is not None:
+                try:
+                    vis_data = render_ray_for_3d_vis(
+                        args,
+                        model,
+                        tmp_ray_sampler,
+                        projector,
+                        sky_style_code=z,
+                        sky_model=sky_model,
+                        data_mode='val'
+                    )
+                    viewer.update_point_cloud(vis_data)
+                except Exception as e:
+                    print(f"Error updating viewer: {e}")
+
             'LinGaoyuan_operation_20240927: add new parameter to log_view, set ret_alpha == True to always return depth map, set prefix == val'
-            # Get 3D visualization data
-            point_cloud_data = render_ray_for_3d_vis(
-                args,
-                model,
-                tmp_ray_sampler,
-                projector,
-                sky_style_code=z,
-                sky_model=sky_model,
-                data_mode='val'
-            )
-            
-            # Update visualization
-            update_visualization(server, point_cloud_data)
-            
             psnr_curr_img, lpips_curr_img, ssim_curr_img = log_view(
                 indx,
                 args,
@@ -239,10 +196,6 @@ def eval(args):
             ssim_scores.append(ssim_curr_img)
             torch.cuda.empty_cache()
             indx += 1
-            
-            # Add a small delay to allow visualization to update
-            time.sleep(0.1)
-            
     print("Average PSNR: ", np.mean(psnr_scores))
     print("Average LPIPS: ", np.mean(lpips_scores))
     print("Average SSIM: ", np.mean(ssim_scores))
@@ -252,6 +205,10 @@ def eval(args):
     np.savetxt(os.path.join(out_folder, 'psnr_scores.txt'), psnr_scores, delimiter=',')
     np.savetxt(os.path.join(out_folder, 'ssim_scores.txt'), ssim_scores, delimiter=',')
     np.savetxt(os.path.join(out_folder, 'lpips_scores.txt'), lpips_scores, delimiter=',')
+
+    # Close viewer if it was initialized
+    if viewer is not None:
+        viewer.close()
 
 
 
