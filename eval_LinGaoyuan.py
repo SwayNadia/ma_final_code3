@@ -3,6 +3,9 @@ import numpy as np
 import shutil
 import torch
 import torch.utils.data.distributed
+import viser
+import threading
+import time
 
 from torch.utils.data import DataLoader
 
@@ -43,13 +46,85 @@ def synchronize():
     dist.barrier()
 
 
+def create_viser_server():
+    """Create and configure viser server for 3D visualization."""
+    server = viser.ViserServer()
+    
+    # Configure environment
+    server.scene.configure_environment_map(
+        hdri="warehouse",
+        background=True,
+        background_intensity=1.0
+    )
+    
+    # Add world frame
+    server.scene.add_frame(
+        name="world_frame",
+        show_axes=True,
+        axes_length=1.0,
+        axes_radius=0.02
+    )
+    
+    return server
+
+def update_visualization(server, point_cloud_data):
+    """Update the 3D visualization with new point cloud data."""
+    # Remove existing point cloud if it exists
+    try:
+        server.scene.remove_by_name("scene_points")
+    except:
+        pass
+    
+    # Add new point cloud
+    point_cloud = server.scene.add_point_cloud(
+        name="scene_points",
+        points=point_cloud_data["points"],
+        colors=point_cloud_data["colors"],
+        point_size=0.01,
+        point_shape="circle"
+    )
+    
+    # Add normals if available
+    if point_cloud_data["normals"] is not None:
+        try:
+            server.scene.remove_by_name("normals")
+        except:
+            pass
+            
+        # Calculate normal endpoints
+        normal_endpoints = point_cloud_data["points"] + point_cloud_data["normals"] * 0.1
+        normal_lines = np.stack([
+            point_cloud_data["points"],
+            normal_endpoints
+        ], axis=1)
+        
+        # Add normal lines
+        server.scene.add_line_segments(
+            name="normals",
+            points=normal_lines,
+            colors=(255, 0, 0),
+            line_width=1.0
+        )
+
 @torch.no_grad()
 def eval(args):
-
     device = "cuda:{}".format(args.local_rank)
     out_folder = os.path.join(args.rootdir, "out", args.expname)
     print("outputs will be saved to {}".format(out_folder))
     os.makedirs(out_folder, exist_ok=True)
+
+    # Create viser server
+    server = create_viser_server()
+    
+    # Start viser server in a separate thread
+    def run_server():
+        server.sleep_forever()
+    
+    server_thread = threading.Thread(target=run_server)
+    server_thread.daemon = True
+    server_thread.start()
+    
+    print(f"Viser server started at http://localhost:{server.get_port()}")
 
     # save the args and config files
     f = os.path.join(out_folder, "args.txt")
@@ -129,6 +204,20 @@ def eval(args):
             H, W = tmp_ray_sampler.H, tmp_ray_sampler.W
             gt_img = tmp_ray_sampler.rgb.reshape(H, W, 3)
             'LinGaoyuan_operation_20240927: add new parameter to log_view, set ret_alpha == True to always return depth map, set prefix == val'
+            # Get 3D visualization data
+            point_cloud_data = render_ray_for_3d_vis(
+                args,
+                model,
+                tmp_ray_sampler,
+                projector,
+                sky_style_code=z,
+                sky_model=sky_model,
+                data_mode='val'
+            )
+            
+            # Update visualization
+            update_visualization(server, point_cloud_data)
+            
             psnr_curr_img, lpips_curr_img, ssim_curr_img = log_view(
                 indx,
                 args,
@@ -150,6 +239,10 @@ def eval(args):
             ssim_scores.append(ssim_curr_img)
             torch.cuda.empty_cache()
             indx += 1
+            
+            # Add a small delay to allow visualization to update
+            time.sleep(0.1)
+            
     print("Average PSNR: ", np.mean(psnr_scores))
     print("Average LPIPS: ", np.mean(lpips_scores))
     print("Average SSIM: ", np.mean(ssim_scores))
@@ -273,11 +366,6 @@ def log_view(
     rgb_im[:, : rgb_gt.shape[-2], : rgb_gt.shape[-1]] = rgb_gt
     rgb_im[:, : rgb_coarse.shape[-2], W : W + rgb_coarse.shape[-1]] = rgb_coarse
 
-    # rgb_coarse = rgb_coarse.permute(1, 2, 0).detach().cpu().numpy()
-    # filename = os.path.join(out_folder, prefix[:-1] + "_{:03d}_coarse.png".format(global_step))
-    # rgb_coarse = np.array(Image.fromarray((rgb_coarse * 255).astype(np.uint8)))
-    # imageio.imwrite(filename, rgb_coarse)
-
     'LinGaoyuan_operation_20240927: save rgb_im replace original rgb_coarse'
     rgb_im = rgb_im.permute(1, 2, 0).detach().cpu().numpy()
     filename = os.path.join(out_folder, prefix[:-1] + "_{:03d}_coarse.png".format(global_step))
@@ -286,10 +374,6 @@ def log_view(
 
 
     if depth_coarse is not None:
-        # depth_coarse = depth_coarse.permute(1, 2, 0).detach().cpu().numpy()
-        # depth_coarse = np.array(Image.fromarray((depth_coarse * 255).astype(np.uint8)))
-
-
         'LinGaoyuan_20240927: set sky area of depth image to 200'
         depth_sky = torch.full_like(depth_pred, 200)
         depth_pred_replace_sky = (depth_pred * sky_mask + depth_sky * (1 - sky_mask)).squeeze()
@@ -338,6 +422,107 @@ def log_view(
     print(prefix + "lpips_image: ", lpips_curr_img)
     print(prefix + "ssim_image: ", ssim_curr_img)
     return psnr_curr_img, lpips_curr_img, ssim_curr_img
+
+
+@torch.no_grad()
+def render_ray_for_3d_vis(
+    args,
+    model,
+    ray_sampler,
+    projector,
+    sky_style_code=None,
+    sky_model=None,
+    data_mode=None,
+):
+    """
+    Render rays and return data suitable for 3D visualization in viser.
+    Returns:
+        dict: Contains:
+            - points: 3D points (N, 3)
+            - colors: RGB colors for each point (N, 3)
+            - depths: Depth values for each point (N,)
+            - normals: Surface normals for each point (N, 3)
+    """
+    model.switch_to_eval()
+    with torch.no_grad():
+        ray_batch = ray_sampler.get_all()
+        
+        # Get feature maps
+        if args.use_retr_feature_extractor is False:
+            featmaps = model.feature_net(ray_batch["src_rgbs"].squeeze(0).permute(0, 3, 1, 2))
+        else:
+            featmaps, fpn = model.retr_feature_extractor(ray_batch["src_rgbs"].squeeze(0).permute(0, 3, 1, 2))
+            
+        if args.use_volume_feature is True and args.use_retr_feature_extractor is True:
+            feature_volume = model.retr_feature_volume(fpn, ray_batch)
+        else:
+            feature_volume = None
+
+        # Render the image
+        ret = render_single_image(
+            args,
+            ray_sampler=ray_sampler,
+            ray_batch=ray_batch,
+            model=model,
+            projector=projector,
+            chunk_size=args.chunk_size,
+            N_samples=args.N_samples,
+            inv_uniform=args.inv_uniform,
+            det=True,
+            N_importance=args.N_importance,
+            white_bkgd=args.white_bkgd,
+            render_stride=1,  # Use full resolution for 3D visualization
+            featmaps=featmaps,
+            ret_alpha=True,  # Always return alpha for 3D visualization
+            single_net=True,
+            sky_style_code=sky_style_code,
+            sky_model=sky_model,
+            feature_volume=feature_volume,
+            data_mode=data_mode,
+            use_updated_prior_depth=True
+        )
+
+        # Extract 3D visualization data
+        H, W = ray_sampler.H, ray_sampler.W
+        
+        # Get ray origins and directions
+        ray_origins = ray_batch['ray_o'].reshape(H, W, 3)  # (H, W, 3)
+        ray_dirs = ray_batch['ray_d'].reshape(H, W, 3)     # (H, W, 3)
+        
+        # Get depth values
+        depth = ret["outputs_coarse"]["depth"].reshape(H, W)  # (H, W)
+        
+        # Calculate 3D points
+        points = ray_origins + ray_dirs * depth.unsqueeze(-1)  # (H, W, 3)
+        
+        # Get colors
+        colors = ret["outputs_coarse"]["rgb"].reshape(H, W, 3)  # (H, W, 3)
+        
+        # Get normals if available
+        if "normals" in ret["outputs_coarse"]:
+            normals = ret["outputs_coarse"]["normals"].reshape(H, W, 3)  # (H, W, 3)
+        else:
+            normals = None
+            
+        # Get alpha values
+        alpha = ret["outputs_coarse"]["alpha"].reshape(H, W)  # (H, W)
+        
+        # Create mask for valid points (non-sky regions)
+        valid_mask = (alpha > 0.1) & (depth < 100)  # Adjust thresholds as needed
+        
+        # Flatten and filter data
+        points = points[valid_mask]  # (N, 3)
+        colors = colors[valid_mask]  # (N, 3)
+        depths = depth[valid_mask]   # (N,)
+        if normals is not None:
+            normals = normals[valid_mask]  # (N, 3)
+            
+        return {
+            "points": points.cpu().numpy(),
+            "colors": colors.cpu().numpy(),
+            "depths": depths.cpu().numpy(),
+            "normals": normals.cpu().numpy() if normals is not None else None
+        }
 
 
 if __name__ == "__main__":

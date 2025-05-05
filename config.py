@@ -356,10 +356,4 @@ def config_parser():
         help="will take every 1/N images as LLFF test set, paper uses 8",
     )
 
-    # viser arguments
-    parser.add_argument("--viser_port", type=int, default=8080,
-                      help='port for viser server')
-    parser.add_argument("--i_viser", type=int, default=100,
-                      help='frequency of saving viser data')
-
     return parser
